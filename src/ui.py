@@ -92,12 +92,12 @@ def _selector(frame: pd.DataFrame, key: str) -> int | None:
     return st.selectbox("Seleccione un producto", list(labels), format_func=labels.get, key=key)
 
 
-def render_step_management(user: dict) -> None:
+def render_step_management(user: dict, catalog: pd.DataFrame) -> None:
     st.header("Gestión por pasos")
     frame = _products_frame()
     tabs = st.tabs(["Paso 1 · Informe", "Paso 2 · Canje", "Paso 3 · Proveedor", "Paso 4 · Bulto", "Paso 5 · Resolución"])
     with tabs[0]:
-        _step_1(user, frame)
+        _step_1(user, frame, catalog)
     with tabs[1]:
         _step_2(user, frame)
     with tabs[2]:
@@ -115,24 +115,85 @@ def _read_only_notice(user: dict, step: int) -> bool:
     return allowed
 
 
-def _step_1(user: dict, frame: pd.DataFrame) -> None:
+def _step_1(user: dict, frame: pd.DataFrame, catalog: pd.DataFrame) -> None:
     allowed = _read_only_notice(user, 1)
-    mode = st.radio("Acción", ["Crear producto", "Editar producto"], horizontal=True, key="s1_mode", disabled=not allowed)
+    mode = st.radio("Acción", ["Crear producto", "Editar producto"], horizontal=True, key="s1_mode")
     record = None
     if mode == "Editar producto":
         record_id = _selector(frame, "s1_record")
         record = dict(get_product(record_id)) if record_id else None
     defaults = record or {}
+    record_token = record["id"] if record else "new"
+    catalog_match = pd.DataFrame()
+    if record and not catalog.empty:
+        catalog_match = catalog[
+            (catalog["codigo_reyimen"] == str(record["reyimen_code"]))
+            & (catalog["bodega"] == str(record["origin"]))
+        ]
+    manual_default = catalog.empty or (record is not None and catalog_match.empty)
+    manual_entry = st.checkbox(
+        "Ingreso manual de un producto que no está en el catálogo",
+        value=manual_default,
+        key=f"s1_manual_{record_token}",
+        disabled=not allowed or catalog.empty,
+    )
+
+    if not catalog.empty:
+        warehouses = sorted(catalog["bodega"].dropna().unique().tolist(), key=str.casefold)
+        current_origin = str(defaults.get("origin", ""))
+        if current_origin and current_origin not in warehouses:
+            warehouses.append(current_origin)
+        warehouse_index = warehouses.index(current_origin) if current_origin in warehouses else 0
+        origin = st.selectbox(
+            "Bodega/Farmacia origen *",
+            warehouses,
+            index=warehouse_index,
+            key=f"s1_warehouse_{record_token}",
+            disabled=not allowed,
+        )
+        if not manual_entry:
+            warehouse_catalog = catalog[catalog["bodega"] == origin].drop_duplicates("codigo_reyimen")
+            code_labels = {
+                row.codigo_reyimen: f"{row.codigo_reyimen} — {row.descripcion}"
+                for row in warehouse_catalog.itertuples()
+            }
+            codes = list(code_labels)
+            current_code = str(defaults.get("reyimen_code", ""))
+            code_index = codes.index(current_code) if current_code in codes else 0
+            selected_code = st.selectbox(
+                "Buscar código Reyimen o descripción *",
+                codes,
+                index=code_index,
+                format_func=code_labels.get,
+                key=f"s1_code_{record_token}_{origin}",
+                disabled=not allowed,
+                help="Escriba parte del código o de la descripción para filtrar la lista.",
+            )
+            catalog_row = warehouse_catalog[warehouse_catalog["codigo_reyimen"] == selected_code].iloc[0]
+            defaults = {
+                **defaults,
+                "origin": origin,
+                "reyimen_code": str(catalog_row["codigo_reyimen"]),
+                "description": str(catalog_row["descripcion"]),
+                "unit": str(catalog_row["unidad"]),
+                "estimated_unit_cost": 0 if pd.isna(catalog_row["precio_unitario"]) else float(catalog_row["precio_unitario"]),
+            }
+            st.caption("Descripción, unidad de medida y precio fueron completados desde el inventario institucional.")
+            if pd.isna(catalog_row["precio_unitario"]):
+                st.warning("El precio de este producto aparece oculto como ######## en la planilla fuente. Active el ingreso manual para incorporarlo.")
+    else:
+        origin = str(defaults.get("origin", ""))
+
     with st.form("step1_form"):
         c1, c2, c3 = st.columns(3)
         status = c1.selectbox("Estado del producto", ["En revisión", "Concluido"], index=0 if defaults.get("product_status", "En revisión") == "En revisión" else 1)
         report_date = c2.date_input("Mes de informe", value=pd.to_datetime(defaults.get("report_month", date.today().strftime("%Y-%m"))).date())
-        origin = c3.text_input("Bodega/Farmacia origen *", defaults.get("origin", ""))
+        c3.text_input("Bodega seleccionada", origin, disabled=True)
         c1, c2, c3 = st.columns(3)
         product_type = c1.selectbox("Tipo de producto", ["Fármaco", "Insumo"], index=0 if defaults.get("product_type", "Fármaco") == "Fármaco" else 1)
-        code = c2.text_input("Código Reyimen *", defaults.get("reyimen_code", ""))
-        unit = c3.text_input("Unidad *", defaults.get("unit", ""))
-        description = st.text_input("Descripción *", defaults.get("description", ""))
+        code = c2.text_input("Código Reyimen *", defaults.get("reyimen_code", ""), disabled=not manual_entry, key=f"s1_code_field_{record_token}_{defaults.get('reyimen_code', '')}")
+        unit = c3.text_input("Unidad *", defaults.get("unit", ""), disabled=not manual_entry, key=f"s1_unit_{record_token}_{defaults.get('reyimen_code', '')}")
+        description = st.text_input("Descripción *", defaults.get("description", ""), disabled=not manual_entry, key=f"s1_description_{record_token}_{defaults.get('reyimen_code', '')}")
         c1, c2, c3 = st.columns(3)
         quantity = c1.number_input("Cantidad", min_value=0.0, value=float(defaults.get("quantity", 0)))
         expiration = c2.date_input("Vencimiento", value=pd.to_datetime(defaults.get("expiration_date", date.today())).date())
@@ -140,7 +201,7 @@ def _step_1(user: dict, frame: pd.DataFrame) -> None:
         reason = st.text_area("Motivo de informe *", defaults.get("report_reason", ""))
         c1, c2 = st.columns(2)
         purchase = c1.selectbox("Tipo de compra", ["CENABAST", "Compra Propia"], index=0 if defaults.get("purchase_type", "CENABAST") == "CENABAST" else 1)
-        cost = c2.number_input("Costo unitario estimado ($)", min_value=0.0, value=float(defaults.get("estimated_unit_cost", 0)))
+        cost = c2.number_input("Precio unitario ($)", min_value=0.0, value=float(defaults.get("estimated_unit_cost", 0)), disabled=not manual_entry, key=f"s1_cost_{record_token}_{defaults.get('reyimen_code', '')}")
         submitted = st.form_submit_button("Guardar Paso 1", disabled=not allowed, use_container_width=True)
     if submitted:
         if not all([origin.strip(), code.strip(), unit.strip(), description.strip(), lot.strip(), reason.strip()]):
