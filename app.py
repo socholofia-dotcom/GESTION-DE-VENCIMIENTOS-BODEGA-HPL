@@ -1,6 +1,3 @@
-
-
-
 """Punto de entrada de la aplicación Streamlit."""
 
 from datetime import date
